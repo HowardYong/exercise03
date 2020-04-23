@@ -1,0 +1,905 @@
+---
+title: "SDS 323: Exercises 03"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE, error=FALSE, warning=FALSE, results='hold', message=FALSE}
+# Libraries
+library(mosaic)
+library(LICORS)  # for kmeans++
+library(foreach)
+library(mvtnorm)
+#library(doMC)  # for parallel computing
+library(gamlr) # lasso regression using the gamlr library
+library(broom)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(cluster)    # clustering algorithms
+library(factoextra) # clustering algorithms & visualization
+library(NbClust)
+library(caret)
+library(leaps)
+library(MASS)
+library(FNN)
+library("metricsgraphics")
+library(gridExtra)
+library(grid)
+library(glmnet)
+```
+
+```{r, echo=FALSE, error=FALSE, warning=FALSE, results='hold', message=FALSE}
+# Data
+greenbuildings = read_csv('greenbuildings.csv')
+wine = read_csv('wine.csv')
+social_marketing = read_csv('social_marketing.csv')
+```
+
+## 1) Predictive Model Building: Green Buildings
+
+The objective of this problem was to build a predictive model for rental income price based on the given dataset. The dataset that this model investigated included 7,894 commercial rental properties across the United States, of which, 685 were either LEED or EnergyStar green building certified. The dataset included a variety of building properties and features such as size, leasing rate, age, utilities costs, etc. 
+
+To build a predictive model for this problem, we started with a baseline linear regression model, as shown below.
+
+```{r, echo=FALSE, warning=FALSE, results='hide', message=FALSE}
+lm_base = lm(Rent ~ (. -LEED -Energystar -CS_PropertyID -cluster), data=greenbuildings)
+```
+
+```{r, echo=FALSE}
+#getCall(lm_base)
+coef(lm_base)
+#length(coef(lm_base))
+```
+
+The baseline linear regression model includes all features in the dataset except the property's ID number, the type of green certification it received, and the cluster the property was in. We removed the property ID number because these do not provide insight into the general dataset, rather they are discrete numbers assigned to properties. We elected to produce a model for green certification in general; thus, the individual type of green certification does not necessarily matter. We also disregarded the cluster numbers because they are not a meaningful variables for the regression model. The significance of the clusters were taken account for in other variables such as cluster_rent.
+
+We also considered another linear regression model that utilized stepwise feature selection. We started with all main features and their 2-way interactions and executed forward/backward (both) stepwise AIC feature selection. The stepwise linear regression model coefficients are shown below.
+
+```{r, echo=FALSE, warning=FALSE, results='hide', message=FALSE}
+lm_step = step(lm_base, 
+               scope=~(.)^2,
+               direction='both')
+```
+```{r, echo=FALSE}
+getCall(lm_step)
+coef(lm_step)
+length(coef(lm_step))
+```
+
+We conducted a train/test split and iterated that process 100 times to build an average RMSE for the predictions made by both the baseline and stepwise linear regression models. The RMSE are shown below, where the first column represents the RMSE for the baseline model and the second column the stepwise predictive model.
+
+```{r, echo=FALSE, warning=FALSE, results='hide', message=FALSE}
+rmse = function(y, yhat) {
+  sqrt( mean( (y - yhat)^2 ) )
+}
+n = nrow(greenbuildings)
+n_train = round(0.8*n)  # round to nearest integer
+n_test = n - n_train
+rmse_vals = do(100)*{
+  # re-split into train and test cases with the same sample sizes
+  train_cases = sample.int(n, n_train, replace=FALSE)
+  test_cases = setdiff(1:n, train_cases)
+  green_train = greenbuildings[train_cases,]
+  green_test = greenbuildings[test_cases,]
+  
+  # Fit to the training data
+  # use `update` to refit the same model with a different set of data
+  lm_base = lm(Rent ~ (. -LEED -Energystar -CS_PropertyID -cluster)^2, data=green_train)
+  lm_step = update(lm_step, data=green_train)
+  
+  # Predictions out of sample
+  yhat_test1 = predict(lm_base, green_test, na.action=na.exclude)
+  yhat_test2 = predict(lm_step, green_test, na.action=na.exclude)
+  
+  c(rmse(green_test$Rent, yhat_test1),
+    rmse(green_test$Rent, yhat_test2))
+}
+# noticeable improvement over the starting point!
+```
+```{r, echo=FALSE}
+colMeans(rmse_vals)
+```
+
+We observed that both these 2 predictive models yielded very similar RMSE, with the stepwise feature selected model producing slightly better results. We continued to explore other regularization techniques to mimimize feature selection and improve predictive accuracy and interpretability. We initially split our data into train and test splits, then we continued to split the data into our feature and target set. We did this by encoding our feature set into a model.matrix function and applied log transform to our response variable to form the target set.
+
+```{r, echo=FALSE, results='hidden'}
+n = nrow(greenbuildings)
+n_train = round(0.8*n)  # round to nearest integer
+n_test = n - n_train
+train_cases = sample.int(n, n_train, replace=FALSE)
+test_cases = setdiff(1:n, train_cases)
+green_train = greenbuildings[train_cases,]
+green_test = greenbuildings[test_cases,]
+
+green_train = na.omit(green_train)
+green_train_scx = sparse.model.matrix(Rent ~ (. -LEED -Energystar -CS_PropertyID -cluster)^2, data=green_train)[,-1]
+green_train_scy = log(green_train$Rent)
+dim(green_train_scx)
+dim(green_train)
+length(green_train_scy)
+
+green_test = na.omit(green_test)
+green_test_scx = sparse.model.matrix(Rent ~ (. -LEED -Energystar -CS_PropertyID -cluster)^2, data=green_test)[,-1]
+green_test_scy = log(green_test$Rent)
+dim(green_test)
+dim(green_test_scx)
+length(green_test_scy)
+```
+
+```{r, echo=FALSE, results='hidden'}
+green_cvlasso1 = cv.gamlr(green_train_scx, green_train_scy, free=1:20, nfolds=10)
+```
+
+Next, we performed cross-validation with 10-fold CV and disregarding the main features we wanted to include in the model. We want to conduct CV to identify the optimal value for our penalization coefficient, lambda. The results of the 10-fold CV mean squared error across different lambda values is shown below.
+
+```{r}
+plot(green_cvlasso1)
+```
+
+This plot illustrates that we do not see substantial increase in our MSE until lambda begins to approach > -8. We extracted our one standard error MSE and the corresponding lambda value, which are shown below.
+
+```{r, echo=FALSE}
+lambda_best = green_cvlasso1$lambda.min
+# Minimum MSE
+min(green_cvlasso1$cvm)
+# Lambda for this minimum MSE
+lambda_best
+```
+
+We do not want to necessarily select the lambda with the minimum MSE. The lambda that drives the minimum MSE may reduce the features down, but there will be variability in the MSE. Thus, using the lambda that drives 1 standard deviation away from the minimum MSE allows us to further reduce the number of features included while yielding similar MSE. We see below a list of all the remaining features and their associated coefficients.
+
+```{r, echo=FALSE}
+beta_hat = coef(green_cvlasso1)
+coef_names = rownames(coef(green_cvlasso1))
+##Go through each row and determine if a value is zero
+row_sub = apply(beta_hat, 1, function(row) all(row !=0 ))
+##Subset as usual
+beta_hat = beta_hat[row_sub,]
+beta_hat
+```
+
+Now, we applied the optimal lambda identified through cross validation to our regression model. Below, we produce the results for the RMSE and R^2 of the predictions for the test split of the data, as well as a plot of the model.
+
+```{r, echo=FALSE}
+lasso_model = glmnet(green_train_scx, green_train_scy, alpha=1, lambda=lambda_best, standardize=TRUE)
+predictions_train1 = predict(lasso_model, s=lambda_best, newx=green_test_scx)
+predictions_train2 = predict(lm_base, green_test, na.action=na.exclude)
+predictions_train3 = predict(lm_step, green_test, na.action=na.exclude)
+```
+
+```{r, echo=FALSE}
+eval_results <- function(true, predicted, df) {
+  SSE <- sum((predicted - true)^2)
+  SST <- sum((true - mean(true))^2)
+  R_square <- 1 - SSE / SST
+  RMSE = sqrt(SSE/nrow(df))
+
+  # Model performance metrics
+  data.frame(
+    RMSE = RMSE,
+    Rsquare = R_square
+  )
+}
+eval_results(green_test_scy, predictions_train1, green_test_scx)
+lasso_model = glmnet(green_train_scx, green_train_scy, alpha=1, standardize=TRUE)
+plot(lasso_model, xvar='lambda')
+abline(v=log(green_cvlasso1$lambda.min), col='red', lty='dashed')
+abline(v=log(green_cvlasso1$lambda.1se), col='red', lty='dashed')
+```
+
+To provide some visual assessment of the lasso regression, below is a plot describing every feature and interaction remaining in the regression model. The other features and interactions were forced toward 0 as a result of the penalty parameter. The features included in the model are marked as blue/green data points while those not included in the model are red. The x-axis shows the corresponding coefficient value.
+
+```{r, echo=FALSE}
+lasso_model = glmnet(green_train_scx, green_train_scy, alpha=1, lambda=lambda_best, standardize=TRUE)
+coef(lasso_model, s = "lambda.1se") %>%
+  tidy() %>%
+  filter(row != "(Intercept)") %>%
+  ggplot(aes(value, reorder(row, value), color = value > 0)) +
+  geom_point(show.legend = FALSE) +
+  ggtitle("Influential variables") +
+  xlab("Coefficient") +
+  ylab(NULL)
+```
+
+All in all, we compare the RMSE and Rsquare values of the different regression models we explored in the table below. The first row is the baseline regression, the second the stepwise selection, and the last being the lasso regression. Observe that the lasso regression produces a model that more acccurately predicts results, uses less features (more interpretable), and has stronger precision.
+
+```{r, echo=FALSE}
+sum_results = matrix(nrow=3, ncol=2, byrow=TRUE)
+sum_results = eval_results(green_test_scy, predictions_train1, green_test_scx)
+sum_results = rbind(sum_results, c(eval_results(green_test$Rent, predictions_train2, green_test)))
+sum_results = rbind(sum_results, c(eval_results(green_test$Rent, predictions_train3, green_test)))
+sum_results
+```
+
+Now, the next aspect of the problem asked to investigate how our model predicts the average change in rental income per square foot (absolute or percentage terms) associated with green certification. In order to conduct this analysis, our general pipeline was to first subset the greenbuildings.csv dataset into green and non-green buildings only first. Next, we would continue to follow the same procedures shown above for lasso regression for both the green buildings dataset and non-green buildings dataset. Lastly, we would calculate the average rent ($/sqft) from our predictions for green and non-green buildings and make comparisons.
+
+```{r, echo=FALSE, results='hidden'}
+green = subset(greenbuildings, greenbuildings[14] == 1)
+not_green = subset(greenbuildings, greenbuildings[14] == 0)
+
+#GREEN
+n = nrow(green)
+n_train = round(0.8*n)  # round to nearest integer
+n_test = n - n_train
+train_cases = sample.int(n, n_train, replace=FALSE)
+test_cases = setdiff(1:n, train_cases)
+green_train = green[train_cases,]
+green_test = green[test_cases,]
+
+green_train = na.omit(green_train)
+green_train_scx = sparse.model.matrix(Rent ~ (. -LEED -Energystar -CS_PropertyID -cluster)^2, data=green_train)[,-1]
+green_train_scy = log(green_train$Rent)
+
+green_test = na.omit(green_test)
+green_test_scx = sparse.model.matrix(Rent ~ (. -LEED -Energystar -CS_PropertyID -cluster)^2, data=green_test)[,-1]
+green_test_scy = log(green_test$Rent)
+
+green_cvlasso1 = cv.gamlr(green_train_scx, green_train_scy, free=1:20, nfolds=10)
+lambda_best = green_cvlasso1$lambda.min
+beta_hat = coef(green_cvlasso1)
+coef_names = rownames(coef(green_cvlasso1))
+lasso_model = glmnet(green_train_scx, green_train_scy, alpha=1, lambda=lambda_best, standardize=TRUE)
+green_predictions = predict(lasso_model, s=lambda_best, newx=green_test_scx)
+dim(green_predictions)
+green_predictions <- apply(green_predictions, 1:2,FUN=function(x) exp(x))
+
+#NOT GREEEN
+n = nrow(not_green)
+n_train = round(0.8*n)  # round to nearest integer
+n_test = n - n_train
+train_cases = sample.int(n, n_train, replace=FALSE)
+test_cases = setdiff(1:n, train_cases)
+green_train = not_green[train_cases,]
+green_test = not_green[test_cases,]
+
+green_train = na.omit(green_train)
+green_train_scx = sparse.model.matrix(Rent ~ (. -LEED -Energystar -CS_PropertyID -cluster)^2, data=green_train)[,-1]
+green_train_scy = log(green_train$Rent)
+
+green_test = na.omit(green_test)
+green_test_scx = sparse.model.matrix(Rent ~ (. -LEED -Energystar -CS_PropertyID -cluster)^2, data=green_test)[,-1]
+green_test_scy = log(green_test$Rent)
+
+green_cvlasso1 = cv.gamlr(green_train_scx, green_train_scy, free=1:20, nfolds=10)
+lambda_best = green_cvlasso1$lambda.min
+beta_hat = coef(green_cvlasso1)
+coef_names = rownames(coef(green_cvlasso1))
+lasso_model = glmnet(green_train_scx, green_train_scy, alpha=1, lambda=lambda_best, standardize=TRUE)
+not_green_predictions = predict(lasso_model, s=lambda_best, newx=green_test_scx)
+dim(not_green_predictions)
+not_green_predictions <- apply(not_green_predictions, 1:2,FUN=function(x) exp(x))
+```
+
+After running our lasso regression model, we transformed the predicted results for rent back to true values as they were previously transformed to a log scale during regression. The average rent ($/sqft) for green and non-green buildings are shown below.
+
+```{r}
+avg_green = sum(green_predictions)/dim(green_predictions)[1]
+avg_green
+```
+
+```{r}
+avg_not_green = sum(not_green_predictions)/dim(not_green_predictions)[1]
+avg_not_green
+```
+
+Next, we used these mean rent values to determine a percentage difference between the two categories of buildings. We observe that on average, there was approximately a 5.00% to 6.00% higher rent for green buildings than non-green buildings.
+
+```{r}
+percentage_diff = (avg_green/avg_not_green - 1) * 100
+percentage_diff
+```
+
+However, this does not tell much about the total building revenue. To put this percentage difference into context, we pursued to find the average size of both green and non-green buildings (sqft). Then, we multiplied those average sizes by the average leasing rate of the building, which would effectively return the amount of square footage capable of returning revenue.
+
+```{r}
+avg_occupied_green = sum(green[3])/dim(green[3])[1] * sum(green[6])/dim(green[6])[1]/100
+avg_occupied_notgreen = sum(not_green[3])/dim(not_green[3])[1] * sum(not_green[6])/dim(not_green[6])[1]/100
+
+avg_rev_green = avg_occupied_green * avg_green
+avg_rev_notgreen = avg_occupied_notgreen * avg_not_green
+perecentage_diff_rev = (avg_rev_green/avg_rev_notgreen - 1) * 100
+perecentage_diff_rev
+```
+
+In conclusion, we observe that green buildings on average yield approximately 65.4% higher revenues for their occupied leasing space than non-green buildings.
+
+In this problem, we investigated different methods and techniques for predicting building rental income. We started with a basic linear regression model which included almost all features and interactions, minus the ones that were merely labels or provided no meaningful insight to the rent. We then applied stepwise feature selection in an attempt to identify which features and interactions contirbute the most in predicting accurate rental prices. Lastly, we applied a lasso regression and cross-validation to reduce the number of features and produce a more accurate predictive model. We compared the RMSE of each regression method and found that our results supported the conclusion that the lasso regression model allowed the best balance between interpretability and accuracy. Once we honed in on our best model selection, we applied our regression model specifically to only green and non-green buidlings and found that the average rent in $/sqft for green buildings was 5-6% higher than non-green buildings. After calculating the approximate average, capitalizable real estate (sqft) for green and non-green buildings, we discovered that green buildings on average reap greater than 65% rental income than non-green buildings.
+
+## 2) What Causes What? (Planet Money Podcast)
+
+#### A) Why can’t I just get data from a few different cities and run the regression of “Crime” on “Police” to understand how more cops in the streets affect crime? (“Crime” refers to some measure of crime rate and “Police” measures the number of cops in a city.)
+
+###### Confounding Variables:
+
+The main flaw in this approach has to do with the presence of many confounding variables. In other words, there might be plenty of factors that also influence the crime rates that coincidentally occur when more cops are in the streets. Other variables such as the time of week, month, or year, or even the sizes of the city, the mean socioeconomic status of its residents, and level of tourism may all influence both the crime rate and/or the number of police in the city. These other variables cause feature interactions and should also be taken account for in a regression model. Thus, running a regression of "Crime" on "Police" would make a poor predictive model. The podcast mentions some examples, such as the possibility that crime rates reduce because criminals are afraid of increased potential terrorism activity (since it is an alert day) so they are less likely to go outside, or even the fact that more cops just happen to be out during bad weather days (rainy/stormy) in order to assist any citizens in need. As we have shown, one cannot simply infer that more cops on the streets leads to lower crime rates.
+
+###### Representative Sampling:
+
+For starters, you would have to choose "a few different cities" that are representative of other cities around the country. If you are from the United States, you know this would likely be next to impossible, as many cities are significantly different in terms of size, population, geography, and much more. Again, these differences can largely contribute to the observed results. 
+
+###### Correlation **IS NOT** Causation:
+
+Finally, the golden rule. Although a regression can provide meaningful insight, it does not necessarily determine a causal relationship between the variables, only correlations. This is due the the reasons mentioned above.
+
+#### B) How were the researchers from UPenn able to isolate this effect? Briefly describe their approach and discuss their result in the “Table 2” below, from the researchers' paper.
+![](ex3table2.jpg)
+
+
+In summary, Table 2 shows the results for the investigators' most basic regression where they looked at daily crime totals versus terror alert level. The investigators hypothesized that crime fell during high-alert days due to a greater presence of police in the public. However, another potential theory could be that the target audience of crimes could be reduced during high-alert days. For example, tourism is reduced on high-alert days; thus, the number of potential victims is reduced, leading to fewer crimes. Consequently, the researchers from UPenn wanted to test whether fewer visitors could explain their results, so they acquired daily data on public transportation (Metro) ridership. The researchers included logged mid-day Metro ridership directly into the regression. The coefficient at high-alert days shrinks slightly to 6 crimes per day instead of 7. We see in row 2 that a 10% increase in Metro ridership increases the number of crimes by about 1.7 per day on average. Thus, if we assume that Metro ridership gives a good approximation for the number of daily visitors at a given day, then the changes in number of visitors cannot explain a general change in crime rate. Both regressions produce similar coefficients of determination of .14 and .17 respectively. This hints at relatively low correlations.
+
+
+#### C) Why did they have to control for Metro ridership? What was that trying to capture?
+
+
+The researchers find that increased Metro ridership is correlated with an increase in crime. However, the change associated with ridership appears to be insignificant (a 10% increase in Metro ridership increases the number of crimes by only 1.7 per day on average). Therefore, even though Metro ridership appears to be a good proxy for tourism, changes in the number of tourists cannot necessarily explain the systematic change in crime that we estimate. (according to the research)
+
+In column ii of Table 2 we verify that high alert levels are not being confounded with tourism levels by including logged mid-day Metro ridership directly in the regression. The researchers were using Metro ridership as a proxy for estimating the number of tourist visitors at the National Mall. Because tourist visitors may be a target audience for crimes, a greater number of visitors on a given day may imply more crimes. However, the researchers from UPenn did not necessarily believe that increased tourist visitors would lead to more crimes observed, because they did not expect daily crime to vary by a statistically significant amount with the number of daily visitors. Thus, the investigators wanted to verify by including logged midday ridership in their regression model and measuring how much their regression coefficient for crime and police changed. The purpose of this was to test whether fewer visitors could explain the results obtained in the daily data on public transportation. Metro ridership had to be controlled because it had no impact on the crime rates. The researchers found that even when accounting for ridership rates, crime rates did not significantly change. Adding a variable to represent the Metro ridership only changes the crime rate for the high alert variable from -7.316 to -6.046 which is not a significant change, and therefore crime rates do not change by a meaningful amount as this variable changes. If there was a significant change, it would need to be accounted for in the analysis.
+
+
+#### D) Below I am showing you "Table 4" from the researchers' paper. Just focus on the first column of the table. Can you describe the model being estimated here? What is the conclusion?
+![](ex3table4.jpg)
+
+The first column represents a robust model controlling for ridership as well as differences between districts. The model here is attempting to account for the differences accross districts, especially controlling for District 1 (known as the National Mall) because it is where the White House, Congress, the Smithsonian and many other prominent government agencies and public areas of Washington are located. Therefore, the assumption was made that all of the increased protection falls on District 1. According to the research, during high-alert levels, crime in the National Mall area falls by 2.62 crimes per day. Crime also falls in the other districts, by 0.571 crimes per day but this effect is not statistically significant.  The research finds that almost one half (43.6%) of the total crime drop during highalert periods is concentrated in District 1, the National Mall area. The difference between the High Alert x District One and the High Alert x Other Districts coefficients controls for all common factors between the districts. This includes factors such as weather, tourism, or other events that affect the districts similarly. There still remains an issue with the introduction of confounding variables. If bad weather, for example, causes decreases in crime, a coincidental correlation with high-alert timing could confound our results. Since the cameras are more active and cover more area in District 1 on high alert days, that also may be a reason for higher reported crimes compared to days where there is no alert and therefore less camera activity. Even after controlling for all such factors, it still suggests that crime falls in District 1 during high-alert periods by about 2 crimes per day or more than 12 percent.
+
+To summarize, the first column from Table 4 shows the results of their regression model. However, the column includes coefficients for the relationship between crime and police presence for District 1 (National Mall) and all the other districts. The researchers are summarizing their linear regression model. The rate at which crimes decrease (the slope or beta) in District 1 is by approximately 2.6 crimes per day and in Other Districts is by 0.571 crimes per day. We see that of the total crime drop during high-alert periods, a vast majority of the decrease in crime can be found in District 1 (National Mall). Thus, the conclusion is that most of the increased police presence leads to a decreased crime rates in District 1 because that is where the White House, Congress, and major political establishments reside.
+
+## 3) Clustering & Principal Component Analysis (PCA): Wine
+
+#### Data Exploratory Analysis
+
+The objective of this problem was to use both PCA and k-means to reduce dimensionality in an attempt to identify clusters of wine, perhaps by the color (white or red). The dataset provided 11 different features that described the chemical properties of wine, including a wide variety of characteristics such as fixed acidity, residual sugar, free sulfur dioxide, etc. Additionally, a quality rating for each wine (scale of 1-10) and a color label for the wine were also included in the dataset. Below, observe the mean quality rating for the white and red wines, respectively. Using the quality variable, we can compare the average ratings of both white and red wines to determine a preference among the "certified" judges.
+
+```{r}
+# White Wine Average Rating
+white = subset(wine, color == 'white')
+mean(white$quality)
+# Red Wine Average Rating
+red = subset(wine, color == 'red')
+mean(red$quality)
+```
+
+As shown, white wine received a higher average rating of about 5.88 whereas red wine received an average rating of about 5.64. This shows an insignificant difference between the ratings for the two types of wine.
+
+Next, we can plot some of the variables against each other to observe chemical properties that potentially differ between red and white wine. Some of these variables that appear to have an impact include: Sulphates, Chlorides, Total Sulfur Dioxide, as well as both Fixed & Volatile Acidity. 
+
+```{r, echo=FALSE, results='hide'}
+p1 <- ggplot(wine) + geom_point(aes(x=sulphates, y=chlorides, color=color))
+p2 <- ggplot(wine) + geom_point(aes(x=fixed.acidity, y=volatile.acidity, color=color))
+```
+```{r, echo=FALSE}
+grid.arrange(p1, p2, ncol = 2)
+```
+
+As you can see, there appears to be a difference between the two wine colors regarding these spcific chemical properties.
+
+#### PCA Analysis
+
+First, we wanted to apply some technique of dimensionality reduction to the dataset to make our analysis more interpretable. Principle components analysis allow us to go from 11 features to looking at a few principle component summaries that take into account a wide majority of the variance in the data. Thus, we would be able to more easily cluster the data and visualize it for just the few principle components we select.
+
+As you can see, we collected the principle components and plotted the proportion of variance contributed against the principle component. We also plotted the cumulative proportion of variance against the number of principle components. We aimed to select the principle components with standard deviations of at least 1, but in general, we wanted to simply include enough principle components to cover a significant amount of the variance in the data while maintaining a simple model. 
+
+```{r, echo=FALSE}
+# Excludes Quality and Color
+wine.pca <- prcomp(wine[c(1:11)], center = TRUE, scale = TRUE) 
+summary(wine.pca)
+```
+
+Standard deviation: these are the eigenvalues in our case since the data has been centered and scaled (standardized)
+
+Proportion of Variance: this is the amount of variance the component accounts for in the data, ie. PC1 accounts for >27% of total variance in the data alone
+
+Cumulative Proportion: This is simply the accumulated amount of explained variance, ie. if we used the first 10 components we would be able to account for >99% of total variance in the data.
+
+Since an eigenvalue < 1 would mean that the component actually explains less than a single explanatory variable, we will utilize the first three principal components. This is shown below:
+```{r, echo=FALSE}
+screeplot(wine.pca, type = "l", npcs = 15, main = "The first 10 PCs")
+abline(h = 1, col="red", lty=5)
+legend("topright", legend=c("Eigenvalue = 1"),
+       col=c("red"), lty=5, cex=0.6)
+```
+
+
+The fourth prinicpal component falls just below the threshold, so it has potential to also provide some meaningful results. However, for the following analysis, we will not include it.
+
+Through these first three principal components, we are able to preserve about 64% of the variance (pretty good). This means that we can effectively reduce dimensionality from 11 to 3 while only losing about 36% of variance.
+
+```{r, echo=FALSE}
+cumpro <- cumsum(wine.pca$sdev^2 / sum(wine.pca$sdev^2))
+plot(cumpro[0:15], xlab = "PC #", ylab = "Amount of Explained Variance", main = "Cumulative Variance")
+abline(v = 3, col="blue", lty=5)
+abline(h = 0.6436, col="blue", lty=5)
+legend("topleft", legend=c("Cut-off @ PC3"),
+       col=c("blue"), lty=5, cex=0.6)
+```
+
+
+Now we can visually assess these principal components against each other to get an idea of how the data could potentially be clustered.
+
+```{r, echo=FALSE, results='hide', fig.show='hold', fig.align='center', fig.hold='hold'}
+# 1 & 2
+p3 <- plot(wine.pca$x[,1],wine.pca$x[,2], xlab="PC1 (27.54%)", ylab = "PC2 (22.67%)", main = "PC1 / PC2 - plot")
+# 2 & 3
+p4 <- plot(wine.pca$x[,2],wine.pca$x[,3], xlab="PC2 (22.67%)", ylab = "PC3 (14.15%)", main = "PC2 / PC3 - plot")
+# 1 & 3
+p5 <- plot(wine.pca$x[,1],wine.pca$x[,3], xlab="PC1 (27.54%)", ylab = "PC3 (14.15%)", main = "PC1 / PC3 - plot")
+```
+```{r, echo=FALSE, results='hide'}
+#grid.arrange(p3, p4, p5, ncol = 3)
+```
+
+There are clearly some distinct patterns among these principal components, so we will take it a step further to get an idea as to the identification of these clusters in context. If you remember, we would like to explain the difference between red and white wines.
+
+```{r, echo=FALSE}
+fviz_pca_ind(wine.pca, geom.ind = "point", pointshape = 21, 
+             pointsize = 2, 
+             fill.ind = wine$color, 
+             col.ind = "black", 
+             palette = "jco", 
+             addEllipses = TRUE,
+             label = "var",
+             col.var = "black",
+             repel = TRUE,
+             legend.title = "Color") +
+  ggtitle("2D PCA-Plot of PC1 & PC2 (from 11 feature dataset)") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+With just the first two components, we can clearly see some separation between the white and red wines. This could also be analyzed using PC1 & PC3 as well as PC2 & PC3 as shown previously. With this in mind, we will now perform a clustering algorithm (kmeans) to obtain further insights as to the grouping of these wines.
+
+#### K-Means
+
+After conducting a principle components analysis, we were able to identify the first 3 principle components to have encompassed a majority of the variance in the dataset (approximately 63%). Thus, instead of clustering against 11 dimensions, we were able to reduce the data to 3 dimensions and apply K-means clustering, while still capturing a majority of the variance in the data. We applied 2 clusters as our input to predict the difference between red and white wines.
+
+```{r}
+input <- wine[c(1:11)]
+# Extract the centers and scales from the rescaled data (which are named attributes)
+X = scale(input, center=TRUE, scale=TRUE)
+# Center and scale the data
+mu = attr(X,"scaled:center")
+sigma = attr(X,"scaled:scale")
+# Run k-means with 2 clusters and 25 starts
+clust = kmeans(X, centers=2, nstart=25)
+```
+
+We can observe some of the summary metrics of our k-means analysis as follows:
+
+###### Centers:
+```{r}
+clust$centers*sigma + mu
+```
+
+These are the locations of the centers for both clusters, representing the average chemical properties for each cluster of wines.
+
+###### Within-Cluster Sum of Squares (for each cluster):
+```{r}
+clust$withinss
+```
+
+This metric measures the squared average distance of all the points within a cluster to the cluster centroid. We would like this value to be relatively low, meaning that the clusters are compact.
+
+###### Total Within-Cluster Sum of Squares, i.e. sum(withinss):
+```{r}
+clust$tot.withinss
+```
+
+###### The Between-Cluster Sum of Squares, i.e. totss-tot.withinss:
+```{r}
+clust$betweenss
+```
+
+This metric measures the squared average distance between all centroids. We would like this value to be relatively high, meaning that the clusters are clearly separated from each other.
+
+###### The number of data points in each cluster:
+```{r}
+clust$size
+```
+
+Now, we can pull points from each cluster to determine an overall trend for each cluster to see if we successfully separated the two wines according to their chemical properties.
+
+###### Cluster One
+
+Here is the first few index values for some of the wines that fell in the first cluster.
+
+```{r, echo=FALSE}
+# Which wines are in which clusters?
+clust1<- head(which(clust$cluster == 1))
+clust1
+```
+
+We can use these values to pull the chemical properties of these specific wines to assess the similarities.
+
+```{r, echo=FALSE}
+filter(wine, rownames(wine) == as.integer(clust1[1])) %>% tbl_df %>% print(n = 15)
+filter(wine, rownames(wine) == as.integer(clust1[2])) %>% tbl_df %>% print(n = 15)
+filter(wine, rownames(wine) == as.integer(clust1[3])) %>% tbl_df %>% print(n = 15)
+filter(wine, rownames(wine) == as.integer(clust1[4])) %>% tbl_df %>% print(n = 15)
+filter(wine, rownames(wine) == as.integer(clust1[5])) %>% tbl_df %>% print(n = 15)
+# or: print(your_tbl, n = 1e3)
+```
+
+Now we can do the same with the second cluster.
+
+###### Cluster Two
+
+IDs: 
+
+```{r, echo=FALSE}
+clust2 <- head(which(clust$cluster == 2))
+clust2
+```
+
+Wines in second cluster:
+
+```{r, echo=FALSE}
+#wines2 <- for (val in clust2) {
+#filter(wine, rownames(wine) == val)
+#} 
+#wines2 %>% print(n = 15)
+# or: print(your_tbl, n = 1e3)
+filter(wine, rownames(wine) == as.integer(clust2[1])) %>% tbl_df %>% print(n = 15)
+filter(wine, rownames(wine) == as.integer(clust2[2])) %>% tbl_df %>% print(n = 15)
+filter(wine, rownames(wine) == as.integer(clust2[3])) %>% tbl_df %>% print(n = 15)
+filter(wine, rownames(wine) == as.integer(clust2[4])) %>% tbl_df %>% print(n = 15)
+filter(wine, rownames(wine) == as.integer(clust2[5])) %>% tbl_df %>% print(n = 15)
+```
+
+#### Optimizing K
+
+We see that from our principle components analysis, we were able to capture a majority of the variance in the data through 3 principle components. Running K-means clustering for 2 clusters allowed us to visibly distinguish the red from the white wines. 
+
+While this is was a good start, we can now optimize K by using various methods such as the Elbow Plot, CH Index, and even the Gap Statistic to detemine an optimal number of clusters.
+
+Elbow Plot:
+```{r, echo=FALSE, warning=FALSE}
+# Elbow
+k_grid = seq(2, 10, by=1)
+SSE_grid = foreach(k = k_grid, .combine='c') %do% {
+  cluster_k = kmeans(X, k, nstart=25)
+  cluster_k$tot.withinss
+}
+plot(k_grid, SSE_grid)
+```
+
+This method consists of plotting the Error Sum of Squares (SSE) against multiple values of K (number of clusters). Typically in this method, you chooce the number of clusters around the "elbow" of the plot, which is the point in the plot at which we experience diminishing returns that are not worth the additional cost (potential overfitting). In our case, that elbow lands around K=3 or K=4. Next, we will use another method called CH Index.
+
+CH Index:
+```{r, echo=FALSE, warning=FALSE}
+# CH INdex
+N = nrow(X)
+CH_grid = foreach(k = k_grid, .combine='c') %do% {
+  cluster_k = kmeans(X, k, nstart=25)
+  W = cluster_k$tot.withinss
+  B = cluster_k$betweenss
+  CH = (B/W)*((N-k)/(k-1))
+  CH
+}
+plot(k_grid, CH_grid)
+```
+This method uses between-cluster and within-cluster sums of squares for the k clusters to determien an optimal value for K. Typically in this case, we choose a value of K in which this value is maximized, FOr our case, this is around K=2 or K=3. Finally, we will use the Gap Statistic to find an optimal value of K.
+
+Gap Statistic:
+```{r, echo=FALSE, warning=FALSE}
+# B was 100
+wine_gap = clusGap(X, FUN = kmeans, nstart = 25, K.max = 10, B = 10)
+plot(wine_gap)
+```
+
+This approach compares the total within intra-cluster variation for different values of k with their expected values under a distribution with no obvious clustering. Typically, we look for a dip in the chart, which appears to be around K=5. We can take this a step further by retrieving the information on this plot here:
+
+```{r, echo=FALSE}
+wine_gap
+```
+
+As you can see, the variation dips after K=5 from .0012 to about .0011, and the output recommends 5 clusters.
+
+In summary, we wanted to find what the optimal K value would be for our clustering algorithm to explore how that model may compare. First, we looked at an elbow plot, which measured the SSE versus K. In our elbow plot, we wanted to observe the K value that gives biggest difference in SSE. From our elbow plot, one can see that the optimal K value is between 2 and 3. We also explored the CH index. From our CH index plot, we see, again, the optimal K value is likely around 2 or 3. Lastly, we also included analysis of the gap statistic, and we found that biggest dip in the gap statistic led to an optimal K value of 5. 
+
+In conclusion, we conducted a principle components analysis to reduce the number of dimensions in the dataset that would not lose a statistically significant proportion of variance. We found that 3 principle components captured about 63% of the variance. Coupled with K-means clustering with K=2 clusters, we were able to distinguish red and white wines. However, we also explored defining the optimal K value, which led to a variety of answers based on the statistical metric. This likely means that there may be some similarities between the wines other than just by color, and this makes sense. The problem also considers different qualities of wines. A plausible hypothesis as to why more clusters would be optimal is wines of the same quality rating may share lots of similarities with each other than compared with wines of the same color. Thus, with our analytical pipeline, it may be possible to predict lower and higher quality wines. However, although though we ran measures for optimal K-values, it does not necessarily mean that those produce a better model than one with K=2 clusters. The optimal model may not necessarily be the most interpretable or intuitive.
+
+Although we received a couple of different values of K, the common denominator seems to be about K=3. We will now run k-means using k=3 clusters (the optimal number of k according to our analysis) to see if we can discover what the third cluster might consist of (perhaps it identified more expensive or higher quality wines).
+
+```{r, echo=FALSE, results='hide'}
+input <- wine[c(1:11)]
+# Extract the centers and scales from the rescaled data (which are named attributes)
+X = scale(input, center=TRUE, scale=TRUE)
+# Center and scale the data
+mu = attr(X,"scaled:center")
+sigma = attr(X,"scaled:scale")
+opt_clust = kmeans(X, centers=3, nstart=25)
+```
+```{r, echo=FALSE}
+fviz_cluster(opt_clust, data = input)
+```
+
+It appears that using three clusters breaks up the previously right cluster into two different clusters. We can pull some of these wines to see what might be different about them.
+
+###### Third Cluster
+````{r, echo=FALSE}
+# Which wines are in which clusters?
+clust3<- head(which(opt_clust$cluster == 3))
+clust3
+```
+```{r, echo=FALSE}
+#wines3 <- for (val in clust3) {
+#filter(wine, rownames(wine) == val)
+#} 
+#wines3 %>% print(n = 15)
+# or: print(your_tbl, n = 1e3)
+filter(wine, rownames(wine) == as.integer(clust3[1])) %>% tbl_df %>% print(n = 15)
+filter(wine, rownames(wine) == as.integer(clust3[2])) %>% tbl_df %>% print(n = 15)
+filter(wine, rownames(wine) == as.integer(clust3[3])) %>% tbl_df %>% print(n = 15)
+filter(wine, rownames(wine) == as.integer(clust3[4])) %>% tbl_df %>% print(n = 15)
+filter(wine, rownames(wine) == as.integer(clust3[5])) %>% tbl_df %>% print(n = 15)
+```
+
+Conducting further analyses can help us find differences within the third cluster and interpret results, as we did with the first two clusters. However, for the sake of simplicity, we will simply just compare some common metrics..
+
+###### K=2 or K=3?
+
+Although the difference between results for the two K values is dependent on context, we can at least evaluate the common metrics to compare the two models.
+
+###### Within-Cluster Sum of Squares (for each cluster):
+
+```{r}
+clust$withinss # K=2
+opt_clust$withinss # K=3
+```
+
+Remember, we would like this value to be relatively low. As you can see, K=3 produces lower values. However, this is probably because of the way we obtained a K values o3 (using these metrics).
+
+###### The Between-Cluster Sum of Squares, i.e. totss-tot.withinss:
+
+```{r}
+clust$betweenss # K=2
+opt_clust$betweenss # K=3
+```
+
+Remember, we would like this value to be relatively high. Similarly, we find that K=3 produces the higher value. Again, this is because we used these metrics to arrive at a value of K=3. The number of clusters, however, is also sensitive to the context.
+
+###### Summary Questions
+
+Which dimensionality reduction technique makes more sense to you for this data? Convince yourself (and me) that your chosen method is easily capable of distinguishing the reds from the whites, using only the "unsupervised" information contained in the data on chemical properties. Does this technique also seem capable of sorting the higher from the lower quality wines?
+
+## 4) Market Segmentation: Customer Tweeting Habits
+
+Here, we have a dataset comprised of several customer tweeting habits gathered from market-research with the goal of better understanding the company's social-media audience. The tweets over a week long period were categorized into subjects such as politics, sports, television, and more. 
+
+Important note: Two interests of note here are "spam" (i.e. unsolicited advertising) and "adult" (posts that are pornographic or otherwise explicit). There are a lot of spam and pornography "bots" on Twitter; while these have been filtered out of the data set to some extent, there will certainly be some that slip through. There's also an "uncategorized" label. Annotators were told to use this sparingly, but it's there to capture posts that don't fit at all into any of the listed interest categories. (A lot of annotators may used the "chatter" category for this as well.)
+
+The goal is to report interesting market segmentation through the use of clustering and PCA.
+
+#### Exploratory Analysis
+
+```{r, echo=FALSE}
+# How many times did each user tweet? Proportion?
+# Add Total Tweets
+tweets<-data.frame(social_marketing)
+summed <- rowSums(tweets[, 2:37])
+tweets$total_tweets = summed
+# Turn Into Proportions
+props<-data.frame(social_marketing)
+props = props[-1]
+```
+
+Here is a summary of the number of tweets per user:
+
+```{r, echo=FALSE}
+summary(tweets$total_tweets)
+```
+
+Here we can find the number of tweets per category overall:
+
+```{r, echo=FALSE}
+par(mar=c(8, 4.1, 4.1, 2.1))
+col_sums = colSums(social_marketing[2:37])
+x <- barplot(col_sums, main="Tweet By Category", las=2, cex.names = 0.9, col="skyblue", ylim=c(0,40000), ylab="Number of Tweets")
+y<-as.matrix(col_sums)
+text(x,y+2,labels=as.character(y), cex=0.8, srt=90, pos=3) 
+```
+
+#### PCA Analysis
+
+In short, PCA allows you to take a dataset with a high number of dimensions and compresses it to a dataset with fewer dimensions, which still captures most variance within the original data. We will use PCA to attempt to cluster the data into customer segments.
+
+```{r, echo=FALSE}
+no_users = social_marketing[-1] # get rid of user string
+# PCA
+pr_out <- prcomp(no_users, center = TRUE, scale = TRUE) #Scaling data before PCA is usually advisable! 
+summary(pr_out)
+```
+
+As you can see, the first 11 PCs containt eigenvalues > 1. Through the first 11 PCs we are able to maintain > 63% of the variance, This is not bad considering the dataset contains 36 features (categories). However, we want to take a look deeper into the context to determine a better representation of customer segments using clustering algorithms. However, first let us analyze the PCA with a couple of plots. 
+
+Variance Maintained per PC:
+
+```{r, echo=FALSE}
+# Screeplot
+pr_var <-  pr_out$sdev ^ 2
+pve <- pr_var / sum(pr_var)
+plot(pve, xlab = "Principal Component", ylab = "Proportion of Variance Explained", ylim = c(0,0.2), type = 'b')
+```
+
+Cumulative Variance Maintained:
+
+```{r, echo=FALSE}
+# Cumulative PVE plot
+plot(cumsum(pve), xlab = "Principal Component", ylab = "Cumulative Proportion of Variance Explained", ylim =c(0,1), type = 'b')
+```
+
+A rule used for choosing the number of PCs is to choose PCs with eigenvalues higher than 1. For now, we will use this for the sake of simplicity in analyzing the PCA. However, in our case, since we are using PCA to determine meaningful market segmentation, one criterion we should definitely consider is whether the PCs we decide on make sense in the context. 
+
+Loadings help describe the weights given to each raw variable in calculating the new principal component.
+
+```{r, echo=FALSE}
+# Rotate loadings
+rot_loading <- varimax(pr_out$rotation[, 1:11])
+rot_loading
+```
+
+The numbers in the table correspond to the relationships between our (raw variables) and the selected components. If the number is positive, the variable positively contributes to the component. If it’s negative, then they are negatively related. The larger the number, stronger the relationship. For example, in PC2, you could likely identify a customer demographic given the positive emphasis on tweets relating to photo sharing, cooking, beauty, and fashion.
+
+#### K-Means
+
+Now that we have hinted at the possibility of identifying cuustomer segments through PCA, we can now run a clustering algorithm on the data to identify our different markets. First, we will find the optimal number of clusters with the previously used methods of Elbow Plots and CH Index.
+
+#### Optimizing K
+
+Elbow Method:
+
+```{r, echo=FALSE, warning=FALSE}
+# Choosing K
+# Elbow
+scaled = scale(social_marketing[,2:37]) # cluster on measurables
+k_grid = seq(2, 50, by=1)
+SSE_grid = foreach(k = k_grid, .combine='c') %do% {
+  cluster_k = kmeans(scaled, k, nstart=25)
+  cluster_k$tot.withinss
+}
+plot(k_grid, SSE_grid)
+```
+
+Remember, we are looking for the "elbow" in the plot, which occers around K=10 or k=11.
+
+CH Index Method:
+
+```{r, echo=FALSE, warning=FALSE}
+# CH INdex
+N = nrow(scaled)
+CH_grid = foreach(k = k_grid, .combine='c') %do% {
+  cluster_k = kmeans(scaled, k, nstart=25)
+  W = cluster_k$tot.withinss
+  B = cluster_k$betweenss
+  CH = (B/W)*((N-k)/(k-1))
+  CH
+}
+plot(k_grid, CH_grid)
+```
+
+Remember that here, we are looking to mazimize this value, which occurs here around K=2 or K=3, asignificantly different result from using the eigenvalues or the elbow method. However, it is important to remember that for our case, we are attempting to identify market segments from some 7000+ users meaning it is unlikely that there are only a few customer profiles. It would probably be better to further refine our definitiosn of different markets. Therefore, we will continue this analysis using K=11.
+
+Now we can use the optimal number of clusters to run kmeans on the dataset and attempt to make sense of some potential customer segments.
+
+```{r, echo=FALSE, warning=FALSE}
+set.seed(123)
+input <- social_marketing[c(2:37)]
+# Extract the centers and scales from the rescaled data (which are named attributes)
+X = scale(input, center=TRUE, scale=TRUE)
+# Center and scale the data
+mu = attr(X,"scaled:center")
+sigma = attr(X,"scaled:scale")
+clust = kmeans(X, centers=11, nstart=25)
+```
+
+
+```{r, echo=FALSE, results='hide', eval=FALSE}
+# PCA on Clusters
+pca <- prcomp(t(input), scale. = T, center = T)
+fviz_eig(pca) + 
+  theme_bw() + scale_y_continuous(labels = scales::comma) +
+  ggtitle(label='Principal Component Analysis')
+```
+```{r, echo=FALSE, results='hide', eval=FALSE}
+cluster.pc10 <- prcomp(input, center = FALSE, scale. = FALSE)$x %>% as.data.frame()
+cluster.pc10$kmeans.cluster <- factor(clust$cluster)
+p<-ggplot(cluster.pc10,aes(x=PC1,y=PC2,color=kmeans.cluster))
+p+geom_point() +
+  theme_bw() + scale_y_continuous(labels = scales::comma) + 
+  ggtitle(label='PCA with 10 cluster K-means')
+```
+```{r, echo=FALSE, results='hide', eval=FALSE}
+fviz_cluster(clust, data = input, geom = "point",
+             stand = FALSE, ellipse.type = "norm") + 
+  theme_bw() + scale_y_continuous(labels = scales::comma) +
+  ggtitle(label='Customer Clusters')
+```
+
+As you might guess, this might be difficult to visually interpret given the number of clusters. Therefore, in order to get a better understanding, we can pull the centers of the clusters to get an idea of the tweeting habits of users in each cluster. Since the center of each cluster is a euclidean distance rather than a specific datapoint, this will allow us to use the centers as a representation of the average user in that cluster (since that is the way the centers are computed).
+
+Here is a snapshot of the centers that would likely represent the tweeting habits of a user from each cluster (the number of tweets per category).
+```{r, echo=FALSE}
+# All centers
+#clust$centers
+clust$center*sigma + mu
+```
+
+```{r, echo=FALSE, results='hide'}
+# Average User in each Cluster
+clust$center[1,]*sigma + mu
+clust$center[2,]*sigma + mu
+clust$center[3,]*sigma + mu
+clust$center[4,]*sigma + mu
+clust$center[4,]*sigma + mu
+clust$center[5,]*sigma + mu
+```
+
+Now, we can plot the tweeting habits of the average user in each c;uster to identify their respective characteristics. For simplicity, we will just plot the first four customers.
+
+```{r, echo=FALSE, results='hide', fig.show='hold', fig.align='center', fig.hold='hold'}
+# Cluster One & CLuster Two
+par(mar=c(8, 4.1, 4.1, 2.1))
+plot(clust$center[1,]*sigma + mu, main="Cluster One", xaxt="n", xlab="", ylab="Number of Tweets")
+axis(1, at=1:36, labels=colnames(social_marketing[2:37]), las=2, cex.axis=0.8)
+par(mar=c(8, 4.1, 4.1, 2.1))
+plot(clust$center[2,]*sigma + mu, main="Cluster Two", xaxt="n", xlab="", ylab="Number of Tweets")
+axis(1, at=1:36, labels=colnames(social_marketing[2:37]), las=2, cex.axis=0.8)
+```
+```{r, echo=FALSE, results='hide', fig.show='hold', fig.align='center', fig.hold='hold'}
+# Cluster Three & Cluster FOur
+par(mar=c(8, 4.1, 4.1, 2.1))
+plot(clust$center[3,]*sigma + mu, main="Cluster Three", xaxt="n", xlab="", ylab="Number of Tweets")
+axis(1, at=1:36, labels=colnames(social_marketing[2:37]), las=2, cex.axis=0.8)
+par(mar=c(8, 4.1, 4.1, 2.1))
+plot(clust$center[4,]*sigma + mu, main="Cluster Four", xaxt="n", xlab="", ylab="Number of Tweets")
+axis(1, at=1:36, labels=colnames(social_marketing[2:37]), las=2, cex.axis=0.8)
+```
+
+If we want, we could also pull specific users from a cluster to verify these results.
+
+```{r, echo=FALSE, results='hide'}
+## retrieve customer ID's in each cluster
+## retrieve customer ID's in each cluster
+#head(gather(data.frame(social_marketing[clust$cluster == 1,])))
+# Work with centroids rather than users themselves
+#filter(social_marketing, X == 'y2g68vhkf')
+
+# Retrieve Row Index
+#group1 <- head(which(clust$cluster == 1))
+#filter(social_marketing, rownames(social_marketing) == 1018)
+```
+
+Here is the first few index values of the users in the first cluster:
+
+````{r, echo=FALSE}
+# Which wines are in which clusters?
+group1<- head(which(clust$cluster == 1))
+group1
+```
+
+Then we can pull the tweets of the first user.
+
+```{r, echo=FALSE}
+user1 <- filter(social_marketing, rownames(social_marketing) == group1[1])
+user1 %>% tbl_df %>% print(n = 40)
+# or: print(your_tbl, n = 1e3)
+```
+
+Fially we can plot these results.
+```{r, echo=FALSE}
+# Cluster One & CLuster Two
+user1 = user1[2:37]
+dbl <- as.double(user1)
+par(mar=c(8, 4.1, 4.1, 2.1))
+plot(dbl, main="User in Cluster One", xaxt="n", xlab="", ylab="Number of Tweets")
+axis(1, at=1:36, labels=colnames(social_marketing[2:37]), las=2, cex.axis=0.8)
+```
+
+This can then be repeated for different users from different clusters to further analyze these users individually. We recommend the large consumer brand use these methods to identify the characteristics of each market segment, then use the campaign to target the users that most closely align with the campaigns target audience.
+
+
+
+
+
