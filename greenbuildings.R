@@ -48,8 +48,7 @@ rmse_vals = do(100)*{
   lm_step = update(lm_step, data=green_train)
   
   # Predictions out of sample
-  yhat_test1 = predict(lm_base, green_test, na.action=na.exclude)
-  yhat_test2 = predict(lm_step, green_test, na.action=na.exclude)
+   
   
   c(rmse(green_test$Rent, yhat_test1),
     rmse(green_test$Rent, yhat_test2))
