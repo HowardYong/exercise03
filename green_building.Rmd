@@ -1,0 +1,300 @@
+---
+title: "green_building"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Green Buildings
+
+### Libraries
+```{r, results='hold', message=FALSE}
+library(tidyverse)
+library(dplyr)
+library(mosaic)
+library(foreach)
+library(doMC)  # for parallel computing
+library(gamlr) # lasso regression using the gamlr library
+library(broom)
+```
+
+### Data
+```{r, echo=FALSE, warning=FALSE, results='hide', message=FALSE}
+getwd()
+setwd('/Users/howardyong/Documents/College/School/Spring2020/Statistical Learning:Inference/exercise3')
+greenbuildings = read_csv('greenbuildings.csv')
+
+summary(greenbuildings)
+dim(greenbuildings)
+head(greenbuildings)
+```
+
+The objective of this problem was to build a predictive model for rental income price based on the given dataset. The dataset that this model investigated included 7,894 commercial rental properties across the United States, of which, 685 were either LEED or EnergyStar green building certified. The dataset included a variety of building properties and features such as size, leasing rate, age, utilities costs, etc. 
+
+To build a predictive model for this problem, we started with a baseline linear regression model, as shown below.
+
+```{r, echo=FALSE, warning=FALSE, results='hide', message=FALSE}
+lm_base = lm(Rent ~ (. -LEED -Energystar -CS_PropertyID -cluster)^2, data=greenbuildings)
+```
+
+```{r, echo=FALSE}
+getCall(lm_base)
+coef(lm_base)
+length(coef(lm_base))
+```
+
+The baseline linear regression model includes all features in the dataset except the property's ID number, the type of green certification it received, and the cluster the property was in. We removed the property ID number because these do not provide insight into the general dataset, rather they are discrete numbers assigned to properties. We elected to produce a model for green certification in general; thus, the individual type of green certification does not necessarily matter. We also disregarded the cluster numbers because they are not a meaningful variables for the regression model. The significance of the clusters were taken account for in other variables such as cluster_rent.
+
+We also considered another linear regression model that utilized stepwise feature selection. We started with all main features and their 2-way interactions and executed forward/backward (both) stepwise AIC feature selection. The stepwise linear regression model coefficients are shown below.
+
+```{r, echo=FALSE, warning=FALSE, results='hide', message=FALSE}
+lm_step = step(lm_base, 
+               scope=~(.)^2,
+               direction='both')
+```
+```{r, echo=FALSE}
+getCall(lm_step)
+coef(lm_step)
+length(coef(lm_step))
+```
+
+We conducted a train/test split and iterated that process 100 times to build an average RMSE for the predictions made by both the baseline and stepwise linear regression models. The RMSE are shown below, where the first column represents the RMSE for the baseline model and the second column the stepwise predictive model.
+
+```{r, echo=FALSE, warning=FALSE, results='hide', message=FALSE}
+rmse = function(y, yhat) {
+  sqrt( mean( (y - yhat)^2 ) )
+}
+n = nrow(greenbuildings)
+n_train = round(0.8*n)  # round to nearest integer
+n_test = n - n_train
+rmse_vals = do(100)*{
+  # re-split into train and test cases with the same sample sizes
+  train_cases = sample.int(n, n_train, replace=FALSE)
+  test_cases = setdiff(1:n, train_cases)
+  green_train = greenbuildings[train_cases,]
+  green_test = greenbuildings[test_cases,]
+  
+  # Fit to the training data
+  # use `update` to refit the same model with a different set of data
+  lm_base = lm(Rent ~ (. -LEED -Energystar -CS_PropertyID -cluster)^2, data=green_train)
+  lm_step = update(lm_step, data=green_train)
+  
+  # Predictions out of sample
+  yhat_test1 = predict(lm_base, green_test, na.action=na.exclude)
+  yhat_test2 = predict(lm_step, green_test, na.action=na.exclude)
+  
+  c(rmse(green_test$Rent, yhat_test1),
+    rmse(green_test$Rent, yhat_test2))
+}
+# noticeable improvement over the starting point!
+```
+```{r, echo=FALSE}
+colMeans(rmse_vals)
+```
+
+We observed that both these 2 predictive models yielded very similar RMSE, with the stepwise feature selected model producing slightly better results. We continued to explore other regularization techniques to mimimize feature selection and improve predictive accuracy and interpretability. We initially split our data into train and test splits, then we continued to split the data into our feature and target set. We did this by encoding our feature set into a model.matrix function and applied log transform to our response variable to form the target set.
+
+```{r, echo=FALSE, results='hidden'}
+n = nrow(greenbuildings)
+n_train = round(0.8*n)  # round to nearest integer
+n_test = n - n_train
+train_cases = sample.int(n, n_train, replace=FALSE)
+test_cases = setdiff(1:n, train_cases)
+green_train = greenbuildings[train_cases,]
+green_test = greenbuildings[test_cases,]
+
+green_train = na.omit(green_train)
+green_train_scx = sparse.model.matrix(Rent ~ (. -LEED -Energystar -CS_PropertyID -cluster)^2, data=green_train)[,-1]
+green_train_scy = log(green_train$Rent)
+dim(green_train_scx)
+dim(green_train)
+length(green_train_scy)
+
+green_test = na.omit(green_test)
+green_test_scx = sparse.model.matrix(Rent ~ (. -LEED -Energystar -CS_PropertyID -cluster)^2, data=green_test)[,-1]
+green_test_scy = log(green_test$Rent)
+dim(green_test)
+dim(green_test_scx)
+length(green_test_scy)
+```
+
+```{r, echo=FALSE, results='hidden'}
+green_cvlasso1 = cv.gamlr(green_train_scx, green_train_scy, free=1:20, nfolds=10)
+```
+
+Next, we performed cross-validation with 10-fold CV and disregarding the main features we wanted to include in the model. We want to conduct CV to identify the optimal value for our penalization coefficient, lambda. The results of the 10-fold CV mean squared error across different lambda values is shown below.
+
+```{r}
+plot(green_cvlasso1)
+```
+
+This plot illustrates that we do not see substantial increase in our MSE until lambda begins to approach > -8. We extracted our one standard error MSE and the corresponding lambda value, which are shown below.
+
+```{r, echo=FALSE}
+lambda_best = green_cvlasso1$lambda.min
+# Minimum MSE
+min(green_cvlasso1$cvm)
+# Lambda for this minimum MSE
+lambda_best
+```
+
+We do not want to necessarily select the lambda with the minimum MSE. The lambda that drives the minimum MSE may reduce the features down, but there will be variability in the MSE. Thus, using the lambda that drives 1 standard deviation away from the minimum MSE allows us to further reduce the number of features included while yielding similar MSE. We see below a list of all the remaining features and their associated coefficients.
+
+```{r, echo=FALSE}
+beta_hat = coef(green_cvlasso1)
+coef_names = rownames(coef(green_cvlasso1))
+##Go through each row and determine if a value is zero
+row_sub = apply(beta_hat, 1, function(row) all(row !=0 ))
+##Subset as usual
+beta_hat = beta_hat[row_sub,]
+beta_hat
+```
+
+Now, we applied the optimal lambda identified through cross validation to our regression model. Below, we produce the results for the RMSE and R^2 of the predictions for the test split of the data, as well as a plot of the model.
+
+```{r, echo=FALSE}
+lasso_model = glmnet(green_train_scx, green_train_scy, alpha=1, lambda=lambda_best, standardize=TRUE)
+predictions_train1 = predict(lasso_model, s=lambda_best, newx=green_test_scx)
+```
+
+```{r, echo=FALSE}
+eval_results <- function(true, predicted, df) {
+  SSE <- sum((predicted - true)^2)
+  SST <- sum((true - mean(true))^2)
+  R_square <- 1 - SSE / SST
+  RMSE = sqrt(SSE/nrow(df))
+
+  # Model performance metrics
+  data.frame(
+    RMSE = RMSE,
+    Rsquare = R_square
+  )
+}
+eval_results(green_test_scy, predictions_train1, green_test_scx)
+lasso_model = glmnet(green_train_scx, green_train_scy, alpha=1, standardize=TRUE)
+plot(lasso_model, xvar='lambda')
+abline(v=log(green_cvlasso1$lambda.min), col='red', lty='dashed')
+abline(v=log(green_cvlasso1$lambda.1se), col='red', lty='dashed')
+```
+
+To provide some visual assessment of the lasso regression, below is a plot describing every feature and interaction remaining in the regression model. The other features and interactions were forced toward 0 as a result of the penalty parameter. The features included in the model are marked as blue/green data points while those not included in the model are red. The x-axis shows the corresponding coefficient value.
+
+```{r, echo=FALSE}
+lasso_model = glmnet(green_train_scx, green_train_scy, alpha=1, lambda=lambda_best, standardize=TRUE)
+coef(lasso_model, s = "lambda.1se") %>%
+  tidy() %>%
+  filter(row != "(Intercept)") %>%
+  ggplot(aes(value, reorder(row, value), color = value > 0)) +
+  geom_point(show.legend = FALSE) +
+  ggtitle("Influential variables") +
+  xlab("Coefficient") +
+  ylab(NULL)
+```
+
+All in all, we compare the RMSE and Rsquare values of the different regression models we explored in the table below. The first row is the baseline regression, the second the stepwise selection, and the last being the lasso regression. Observe that the lasso regression produces a model that more acccurately predicts results, uses less features (more interpretable), and has stronger precision.
+
+```{r, echo=FALSE}
+sum_results = matrix(nrow=3, ncol=2, byrow=TRUE)
+sum_results = eval_results(green_test_scy, predictions_train1, green_test_scx)
+sum_results = rbind(sum_results, c(eval_results(green_test$Rent, predictions_train2, green_test)))
+sum_results = rbind(sum_results, c(eval_results(green_test$Rent, predictions_train3, green_test)))
+sum_results
+```
+
+Now, the next aspect of the problem asked to investigate how our model predicts the average change in rental income per square foot (absolute or percentage terms) associated with green certification. In order to conduct this analysis, our general pipeline was to first subset the greenbuildings.csv dataset into green and non-green buildings only first. Next, we would continue to follow the same procedures shown above for lasso regression for both the green buildings dataset and non-green buildings dataset. Lastly, we would calculate the average rent ($/sqft) from our predictions for green and non-green buildings and make comparisons.
+
+```{r, echo=FALSE, results='hidden'}
+green = subset(greenbuildings, greenbuildings[14] == 1)
+not_green = subset(greenbuildings, greenbuildings[14] == 0)
+
+#GREEN
+n = nrow(green)
+n_train = round(0.8*n)  # round to nearest integer
+n_test = n - n_train
+train_cases = sample.int(n, n_train, replace=FALSE)
+test_cases = setdiff(1:n, train_cases)
+green_train = green[train_cases,]
+green_test = green[test_cases,]
+
+green_train = na.omit(green_train)
+green_train_scx = sparse.model.matrix(Rent ~ (. -LEED -Energystar -CS_PropertyID -cluster)^2, data=green_train)[,-1]
+green_train_scy = log(green_train$Rent)
+
+green_test = na.omit(green_test)
+green_test_scx = sparse.model.matrix(Rent ~ (. -LEED -Energystar -CS_PropertyID -cluster)^2, data=green_test)[,-1]
+green_test_scy = log(green_test$Rent)
+
+green_cvlasso1 = cv.gamlr(green_train_scx, green_train_scy, free=1:20, nfolds=10)
+lambda_best = green_cvlasso1$lambda.min
+beta_hat = coef(green_cvlasso1)
+coef_names = rownames(coef(green_cvlasso1))
+lasso_model = glmnet(green_train_scx, green_train_scy, alpha=1, lambda=lambda_best, standardize=TRUE)
+green_predictions = predict(lasso_model, s=lambda_best, newx=green_test_scx)
+dim(green_predictions)
+green_predictions <- apply(green_predictions, 1:2,FUN=function(x) exp(x))
+
+#NOT GREEEN
+n = nrow(not_green)
+n_train = round(0.8*n)  # round to nearest integer
+n_test = n - n_train
+train_cases = sample.int(n, n_train, replace=FALSE)
+test_cases = setdiff(1:n, train_cases)
+green_train = not_green[train_cases,]
+green_test = not_green[test_cases,]
+
+green_train = na.omit(green_train)
+green_train_scx = sparse.model.matrix(Rent ~ (. -LEED -Energystar -CS_PropertyID -cluster)^2, data=green_train)[,-1]
+green_train_scy = log(green_train$Rent)
+
+green_test = na.omit(green_test)
+green_test_scx = sparse.model.matrix(Rent ~ (. -LEED -Energystar -CS_PropertyID -cluster)^2, data=green_test)[,-1]
+green_test_scy = log(green_test$Rent)
+
+green_cvlasso1 = cv.gamlr(green_train_scx, green_train_scy, free=1:20, nfolds=10)
+lambda_best = green_cvlasso1$lambda.min
+beta_hat = coef(green_cvlasso1)
+coef_names = rownames(coef(green_cvlasso1))
+lasso_model = glmnet(green_train_scx, green_train_scy, alpha=1, lambda=lambda_best, standardize=TRUE)
+not_green_predictions = predict(lasso_model, s=lambda_best, newx=green_test_scx)
+dim(not_green_predictions)
+not_green_predictions <- apply(not_green_predictions, 1:2,FUN=function(x) exp(x))
+```
+
+After running our lasso regression model, we transformed the predicted results for rent back to true values as they were previously transformed to a log scale during regression. The average rent ($/sqft) for green and non-green buildings are shown below.
+
+```{r}
+avg_green = sum(green_predictions)/dim(green_predictions)[1]
+avg_green
+```
+
+```{r}
+avg_not_green = sum(not_green_predictions)/dim(not_green_predictions)[1]
+avg_not_green
+```
+
+Next, we used these mean rent values to determine a percentage difference between the two categories of buildings. We observe that on average, there was approximately a 5.00% to 6.00% higher rent for green buildings than non-green buildings.
+
+```{r}
+percentage_diff = (avg_green/avg_not_green - 1) * 100
+percentage_diff
+```
+
+However, this does not tell much about the total building revenue. To put this percentage difference into context, we pursued to find the average size of both green and non-green buildings (sqft). Then, we multiplied those average sizes by the average leasing rate of the building, which would effectively return the amount of square footage capable of returning revenue.
+
+```{r}
+avg_occupied_green = sum(green[3])/dim(green[3])[1] * sum(green[6])/dim(green[6])[1]/100
+avg_occupied_notgreen = sum(not_green[3])/dim(not_green[3])[1] * sum(not_green[6])/dim(not_green[6])[1]/100
+
+avg_rev_green = avg_occupied_green * avg_green
+avg_rev_notgreen = avg_occupied_notgreen * avg_not_green
+perecentage_diff_rev = (avg_rev_green/avg_rev_notgreen - 1) * 100
+perecentage_diff_rev
+```
+
+In conclusion, we observe that green buildings on average yield approximately 65.4% higher revenues for their occupied leasing space than non-green buildings.
+
+In this problem, we investigated different methods and techniques for predicting building rental income. We started with a basic linear regression model which included almost all features and interactions, minus the ones that were merely labels or provided no meaningful insight to the rent. We then applied stepwise feature selection in an attempt to identify which features and interactions contirbute the most in predicting accurate rental prices. Lastly, we applied a lasso regression and cross-validation to reduce the number of features and produce a more accurate predictive model. We compared the RMSE of each regression method and found that our results supported the conclusion that the lasso regression model allowed the best balance between interpretability and accuracy. Once we honed in on our best model selection, we applied our regression model specifically to only green and non-green buidlings and found that the average rent in $/sqft for green buildings was 5-6% higher than non-green buildings. After calculating the approximate average, capitalizable real estate (sqft) for green and non-green buildings, we discovered that green buildings on average reap greater than 65% rental income than non-green buildings.
+
+
